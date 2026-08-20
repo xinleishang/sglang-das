@@ -261,6 +261,15 @@ class Envs:
     # DeepSeek-V4 only needs the SWA tail during PD prefill/decode transfer.
     # Set to false to restore the legacy admission cap based on the SWA pool.
     SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
+
+    # HiSparse
+    # Kill-switch for the shared-index (IndexShare) swap-in prefetch
+    # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Timing probe: run the swap-in fully but skip the host->device KV bytes,
+    # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
