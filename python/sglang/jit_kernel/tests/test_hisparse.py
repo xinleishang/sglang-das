@@ -3,7 +3,10 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    copy_cache_planned_mla,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -50,6 +53,10 @@ def _run_kernel(
     seq_lens_dtype: torch.dtype = torch.int32,
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
+    miss_src: torch.Tensor | None = None,
+    miss_dst: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+    skip_io: bool = False,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -79,6 +86,10 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=skip_io,
     )
     torch.cuda.synchronize()
     return out
@@ -139,6 +150,76 @@ def _long_case():
     # req 0 physical locs  : slot0->9, slot1->7, slot2->3, slot3->5
     # req 0 newest slot    : slot4/newest -> token 7 at physical loc 11
     return _make_state([[9, 7, 3, 5, 11]], [[1, 4, 2, 5, -1]], [7])
+
+
+def _make_plan(num_reqs: int, num_top_k: int):
+    """Fresh miss_src/miss_dst/miss_count buffers for plan replay."""
+    miss_src = torch.zeros((num_reqs, num_top_k), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.zeros((num_reqs, num_top_k), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros((num_reqs,), dtype=torch.int32, device=DEVICE)
+    return miss_src, miss_dst, miss_count
+
+
+def test_copy_cache_planned_replays_per_request_with_varying_miss_counts() -> None:
+    """copy_cache_planned_mla is launched with one block per request."""
+    state = _make_state(
+        [
+            [9, 7, 3, 5, 11],
+            [12, 10, 8, 6, 14],
+            [15, 4, 2, 1, 13],
+        ],
+        [
+            [1, 4, 2, 5, -1],
+            [0, 1, 2, 3, -1],
+            [9, 8, 7, 6, -1],
+        ],
+        [7, 4, 5],
+    )
+    top_k_tokens = torch.tensor(
+        [[4, 6, 7], [2, 6, 7], [9, 8, 7]], dtype=torch.int32, device=DEVICE
+    )
+    seq_lens = torch.tensor([8, 8, 8], dtype=torch.int32, device=DEVICE)
+    num_reqs = top_k_tokens.shape[0]
+
+    # Anchor: record the miss plan while doing the real swap-in.
+    miss_src, miss_dst, miss_count = _make_plan(num_reqs, top_k_tokens.shape[1])
+    anchor_out = _run_kernel(
+        top_k_tokens=top_k_tokens,
+        seq_lens=seq_lens,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        **state,
+    )
+    assert torch.equal(
+        anchor_out.cpu(),
+        torch.tensor([[7, 9, 11], [8, 12, 14], [15, 4, 13]], dtype=torch.int32),
+    )
+    assert torch.equal(miss_count.cpu(), torch.tensor([1, 1, 0], dtype=torch.int32))
+
+    # Skip layer: replay the plan into a fresh buffer set, independently of the
+    # anchor's own buffers.
+    replay_buffer = torch.full(
+        (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
+    copy_cache_planned_mla(
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        num_real_reqs=torch.tensor([num_reqs], dtype=torch.int32, device=DEVICE),
+        host_cache=state["host_cache"],
+        device_buffer=replay_buffer,
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_blocks=num_reqs,
+    )
+    torch.cuda.synchronize()
+
+    # Only the miss destinations got copied; every other slot stays untouched.
+    assert torch.equal(replay_buffer[9].cpu(), state["host_cache"][6])
+    assert torch.equal(replay_buffer[12].cpu(), state["host_cache"][6])
+    untouched = torch.full((1, KV_DIM), -1, dtype=DTYPE)
+    for loc in [7, 3, 5, 11, 10, 8, 6, 14, 15, 4, 2, 1, 13]:
+        assert torch.equal(replay_buffer[loc].cpu(), untouched)
 
 
 @pytest.mark.parametrize("seq_lens_dtype", [torch.int32, torch.int64])
