@@ -893,7 +893,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 or debug_moe_trace,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -920,7 +920,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=enable,
                 num_indexer_layers=num_indexer_layers,
                 index_topk=index_topk,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -2332,7 +2332,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def max_token_pool_size(self):
-        """Return the max token pool size considering hybrid swa settings."""
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
+            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if size_full is not None:
+                return size_full
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens
         else:
