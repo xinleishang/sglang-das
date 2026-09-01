@@ -60,6 +60,7 @@ sources = [
     "csrc/attention/merge_attn_states.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
+    "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     #"csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
