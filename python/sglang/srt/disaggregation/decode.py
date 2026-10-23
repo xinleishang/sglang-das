@@ -710,9 +710,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_cache_layout = getattr(self.token_to_kv_pool, "kv_cache_layout", None)
+        v41_hisparse = getattr(self.scheduler.hisparse_coordinator, "is_dsv41", False)
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
-            if self.scheduler.enable_hisparse
+            if self.scheduler.enable_hisparse and not v41_hisparse
             else self.token_to_kv_pool
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
@@ -723,7 +724,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else ["VRAM"] * len(kv_data_ptrs)
         )
-        if self.scheduler.enable_hisparse and isinstance(
+        if v41_hisparse:
+            kv_data_ptrs, kv_data_lens, kv_item_lens, kv_data_mem_kinds = (
+                self.scheduler.hisparse_coordinator.get_transfer_buf_infos()
+            )
+        elif self.scheduler.enable_hisparse and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
             device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
@@ -1579,13 +1584,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
-            hisparse_avail = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            )
+            coordinator = self.scheduler.hisparse_coordinator
+            if getattr(coordinator, "is_dsv41", False):
+                available_buffers = (
+                    self.token_to_kv_pool_allocator.available_request_buffers(
+                        coordinator.device_buffer_size
+                    )
+                )
+            else:
+                hisparse_avail = (
+                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+                )
+                available_buffers = hisparse_avail // coordinator.padded_buffer_size
             hisparse_req_budget = max(
                 0,
-                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
+                available_buffers - len(self.transfer_queue.queue),
             )
 
         if self.scheduler.enable_lora:
@@ -2256,6 +2269,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if (
                 self.scheduler.enable_hisparse
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not getattr(self.scheduler.hisparse_coordinator, "is_dsv41", False)
                 and not _is_fake_transfer(decode_req.req)
             ):
                 # alloc_logical_only() already allocated the shared logical pages
@@ -2763,13 +2777,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_tail_len=swa_tail_len,
             )
             # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            if getattr(coordinator, "is_dsv41", False):
+                # All C1/C2 host mirrors and GPU indexers share FULL page IDs.
+                host_indices = kv_loc
+            else:
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.kv.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             kv_loc = self._alloc_for_decode_prealloc(
                 allocator,

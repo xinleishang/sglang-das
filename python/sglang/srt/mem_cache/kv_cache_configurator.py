@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV41HiSparseTokenToKVPoolAllocator,
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
@@ -2572,9 +2573,14 @@ class KVCacheConfigurator:
 
             if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
-                token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
-                    token_to_kv_pool_allocator
+                allocator_cls = (
+                    DeepSeekV41HiSparseTokenToKVPoolAllocator
+                    if any(
+                        ratio in (1, 2) for ratio in token_to_kv_pool.sources_by_ratio
+                    )
+                    else DeepSeekV4HiSparseTokenToKVPoolAllocator
                 )
+                token_to_kv_pool_allocator = allocator_cls(token_to_kv_pool_allocator)
 
             # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
             # free(req) can release c4/c128 pool pages alongside the slot.

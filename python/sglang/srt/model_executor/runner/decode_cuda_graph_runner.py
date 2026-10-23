@@ -1070,7 +1070,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
-            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            coordinator = forward_batch.hisparse_coordinator
+            # V4.1 PD has no admitted requests during capture. Record the swap
+            # kernels with all rows masked; replay supplies the real count.
+            coordinator.num_real_reqs.fill_(
+                0 if getattr(coordinator, "is_dsv41", False) else bs
+            )
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)

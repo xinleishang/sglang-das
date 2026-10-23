@@ -507,6 +507,7 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+
     def __init__(
         self,
         size: int,
@@ -521,6 +522,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         end_layer: int | None = None,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         global_page_size: int | None = None,
+        compress_ratio: int = 4,
     ):
         super().__init__(
             size,
@@ -536,17 +538,17 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             global_page_size=global_page_size,
             kv_layout=kv_layout,
         )
-        # The HiSparse transfer kernels hardcode the V4 token layout.
-        assert self.kv_layout is KVLayout.V4, (
-            f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
-        )
+        assert compress_ratio in (1, 2, 4)
+        assert (
+            compress_ratio != 4 or self.kv_layout is KVLayout.V4
+        ), f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
             device=self.device,
         )
-        self.compress_ratio = 4
+        self.compress_ratio = compress_ratio
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -588,7 +590,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().set_key_buffer_fused(layer_id, loc, cache_k, freqs_cis)
+        return super().set_key_buffer_fused(layer_id, loc, cache_k, freqs_cis=freqs_cis)
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -597,6 +599,33 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
+
+
+class HiSparseLowRatioDevicePool(HiSparseC4DevicePool):
+    """C1/C2 hot KV pool; indexer buffers retain their full logical addressing."""
+
+    def __init__(self, size, page_size, *args, global_page_size, **kwargs):
+        ratio = global_page_size // page_size
+        if ratio not in (1, 2):
+            raise ValueError(f"Expected C1/C2 HiSparse pool, got ratio {ratio}")
+        super().__init__(
+            size,
+            page_size,
+            *args,
+            global_page_size=global_page_size,
+            compress_ratio=ratio,
+            **kwargs,
+        )
+
+    def remap_fused_write_loc(self, raw_loc, positions):
+        """Map completed records, retaining partial C2 rows for state-ring writes."""
+        ratio = self.compress_ratio
+        hot = self.translate_loc_to_hisparse_device(raw_loc // ratio).to(raw_loc.dtype)
+        return torch.where(
+            (raw_loc > 0) & ((positions + 1) % ratio == 0),
+            hot * ratio + ratio - 1,
+            raw_loc,
+        )
 
 
 # Low-ratio indexer-K pool page, in compressed slots: the DeepGEMM indexer reads
@@ -1744,15 +1773,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                         if ratio == 1
                         else split_layout.c2_layer_num
                     )
+                hot_full_size = self.full_size
+                if enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    shrink = parse_hisparse_config().host_to_device_ratio
+                    hot_full_size = (
+                        int(self.full_size / shrink) // page_size * page_size
+                    )
+                    if hot_full_size < page_size:
+                        raise ValueError(
+                            "V4.1 HiSparse GPU pool cannot hold one FULL page"
+                        )
                 self.kv_pools[ratio] = self._make_kv_pool(
-                    size=self.full_size // ratio,
+                    size=hot_full_size // ratio,
                     page_size=page_size // ratio,
                     dtype=dtype,
                     layer_num=source_count,
                     device=device,
                     enable_memory_saver=enable_memory_saver,
                     global_page_size=page_size,
-                    cls=kv_pool_cls,
+                    cls=HiSparseLowRatioDevicePool if enable_hisparse else kv_pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
 

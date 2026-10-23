@@ -272,17 +272,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
+        *,
+        compress_ratio: int = 4,
     ):
         assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
-        assert isinstance(
-            logical_attn_allocator._kvcache.c4_kv_pool, HiSparseC4DevicePool
-        )
-        self.compress_ratio = 4
-
-        self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
+        self.hisparse_kvcache = logical_attn_allocator._kvcache.kv_pools[compress_ratio]
+        assert isinstance(self.hisparse_kvcache, HiSparseC4DevicePool)
+        assert self.hisparse_kvcache.compress_ratio == compress_ratio
+        self.compress_ratio = compress_ratio
         self._size_full = logical_attn_allocator.size_full
         self._size_hisparse = self.hisparse_kvcache.size
 
@@ -310,7 +311,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.hisparse_page_size,
+                    (
+                        self._kvcache.c4_logical_size
+                        if compress_ratio == 4
+                        else self._size_full // compress_ratio
+                    )
+                    + self.hisparse_page_size,
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -638,3 +644,77 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             full_free_group = self.full_free_group
             self.full_free_group = []
             self.free_full(torch.cat(full_free_group))
+
+
+class DeepSeekV41HiSparseTokenToKVPoolAllocator(
+    DeepSeekV4HiSparseTokenToKVPoolAllocator
+):
+    """One logical FULL/SWA allocator, with independent C1/C2 hot allocations.
+
+    Host mirrors use the logical FULL page IDs themselves. Only the coordinator
+    owns hot buffers; releasing logical tokens must not release their hot slots
+    a second time.
+    """
+
+    def __init__(self, logical_attn_allocator):
+        self.logical_attn_allocator = logical_attn_allocator
+        self._kvcache = logical_attn_allocator.get_kvcache()
+        self._size_full = logical_attn_allocator.size_full
+        self.page_size = logical_attn_allocator.page_size
+        self.hisparse_page_size = self.page_size
+        self.dtype = logical_attn_allocator.dtype
+        self.device = logical_attn_allocator.device
+        self.need_sort = logical_attn_allocator.need_sort
+        self.ratio_allocators = {
+            ratio: DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                logical_attn_allocator, compress_ratio=ratio
+            )
+            for ratio, sources in self._kvcache.sources_by_ratio.items()
+            if ratio in (1, 2) and sources
+        }
+        if not self.ratio_allocators:
+            raise ValueError("V4.1 HiSparse requires at least one C1/C2 KV source")
+        self.free_pages = self.release_pages = None
+        self.clear()
+
+    def clear(self):
+        self.logical_attn_allocator.clear()
+        for allocator in self.ratio_allocators.values():
+            allocator.hisparse_attn_allocator.clear()
+            allocator.full_to_hisparse_device_index_mapping[:-1].zero_()
+        self.free_group = None
+        self.full_free_group = []
+
+    def full_available_size(self):
+        return self.logical_attn_allocator.full_available_size()
+
+    def available_size(self):
+        return self.logical_attn_allocator.available_size()
+
+    def available_request_buffers(self, device_buffer_size: int) -> int:
+        return min(
+            allocator.hisparse_attn_allocator.available_size()
+            // (device_buffer_size + allocator.hisparse_page_size)
+            for allocator in self.ratio_allocators.values()
+        )
+
+    def alloc_extend(self, *args, **kwargs):
+        # PD direct-to-host allocates logical pages before admitting a hot buffer.
+        return self.logical_attn_allocator.alloc_extend(*args, **kwargs)
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.free_group is None:
+            self.logical_attn_allocator.free(free_index)
+        else:
+            self.free_group.append(self._copy_for_free_group(free_index))
+
+    def free_hisparse(self, free_indices: torch.Tensor):
+        raise RuntimeError("V4.1 HiSparse hot buffers are owned by the coordinator")
+
+    def debug_print(self) -> str:
+        return self.logical_attn_allocator.debug_print() + ", ".join(
+            f"C{ratio} hot available: {allocator.hisparse_attn_allocator.available_size()}"
+            for ratio, allocator in self.ratio_allocators.items()
+        )

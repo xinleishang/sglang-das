@@ -59,7 +59,7 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config() -> SparseConfig:
+def _parse_sparse_config(config_str: Optional[str] = None) -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
@@ -67,7 +67,9 @@ def _parse_sparse_config() -> SparseConfig:
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
-    extra_config_str = get_memory().hisparse_config
+    extra_config_str = (
+        get_memory().hisparse_config if config_str is None else config_str
+    )
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)
@@ -112,9 +114,9 @@ def _parse_sparse_config() -> SparseConfig:
     )
 
 
-def parse_hisparse_config() -> SparseConfig:
+def parse_hisparse_config(config_str: Optional[str] = None) -> SparseConfig:
     """The hisparse config as resolved, with defaults where none was given."""
-    return _parse_sparse_config()
+    return _parse_sparse_config(config_str)
 
 
 def create_sparse_coordinator(

@@ -43,6 +43,8 @@ class LightopBlockTable(CandidateMetadata):
     valid_lens: torch.Tensor
     # split-KV schedule of the sparse rows, None past the planner's row limit
     schedule: Optional[torch.Tensor]
+    # Same kept blocks in request-local compressed coordinates, for HiSparse.
+    logical_blocks: Optional[torch.Tensor] = None
 
 
 def _int32_lens(seq_lens: torch.Tensor) -> torch.Tensor:
@@ -91,9 +93,16 @@ class LightopCandidateIndexer:
         self._dense_topk(logits, seq_lens, metadata, page_indices, raw_indices)
         with torch.cuda.stream(self.alt_stream):
             self.alt_stream.wait_event(producer_ready)
-            table = self._block_table(logits, seq_lens, metadata)
+            table = self._block_table(
+                logits, seq_lens, metadata, need_raw_indices=raw_indices is not None
+            )
             # select_decode reads these on the main stream
-            for t in (table.phys_blocks, table.valid_lens, table.schedule):
+            for t in (
+                table.phys_blocks,
+                table.valid_lens,
+                table.schedule,
+                table.logical_blocks,
+            ):
                 if t is not None:
                     t.record_stream(main_stream)
             join = torch.cuda.Event()
@@ -119,15 +128,39 @@ class LightopCandidateIndexer:
         logits: torch.Tensor,
         seq_lens: torch.Tensor,
         metadata,
+        need_raw_indices: bool = False,
     ) -> LightopBlockTable:
+        page_table = metadata.page_table
+        if need_raw_indices:
+            # Select once in logical coordinates, then map the same blocks to
+            # pool slots. Compact sparse-row offsets are not HiSparse KV indices.
+            assert metadata.compressed_page_size % self.block_size == 0
+            page_table = torch.arange(
+                page_table.shape[1], dtype=page_table.dtype, device=page_table.device
+            ).repeat(page_table.shape[0], 1)
         phys_blocks, valid_lens = lightop_indexer.candidate_block_table(
             logits,
             seq_lens,
-            metadata.page_table,
+            page_table,
             metadata.compressed_page_size,
             self.topk_blocks,
             self.block_size,
         )
+        logical_blocks = None
+        if need_raw_indices:
+            kept = (
+                torch.arange(self.topk_blocks, device=logits.device)[None, :]
+                * self.block_size
+                < valid_lens[:, None]
+            )
+            logical_blocks = torch.where(kept, phys_blocks, -1)
+            starts = logical_blocks.clamp_min(0).long() * self.block_size
+            page_size = metadata.compressed_page_size
+            slots = (
+                metadata.page_table.gather(1, starts // page_size) * page_size
+                + starts % page_size
+            )
+            phys_blocks = torch.where(kept, slots // self.block_size, -1).to(torch.int32)
         schedule = None
         if lightop_indexer.schedule_rows_supported(valid_lens.numel()):
             # One route per row: select_decode's TB=8 kernel never pairs
@@ -138,6 +171,7 @@ class LightopCandidateIndexer:
             phys_blocks=phys_blocks,
             valid_lens=valid_lens,
             schedule=schedule,
+            logical_blocks=logical_blocks,
         )
 
     def select_decode(
@@ -147,9 +181,12 @@ class LightopCandidateIndexer:
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        assert raw_indices is None
         table = candidate_metadata
         assert isinstance(table, LightopBlockTable), type(table)
+        if raw_indices is not None:
+            assert table.logical_blocks is not None, (
+                "HiSparse requires candidate blocks published with logical indices"
+            )
         logits = lightop_indexer.paged_mqa_logits_fp4(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
@@ -166,5 +203,12 @@ class LightopCandidateIndexer:
             table.phys_blocks,
             page_indices,
             self.block_size,
-            None,
+            raw_indices,
         )
+        if raw_indices is not None:
+            compact = raw_indices.long()
+            blocks = table.logical_blocks.gather(
+                1, compact.clamp_min(0) // self.block_size
+            )
+            logical = blocks * self.block_size + compact % self.block_size
+            raw_indices.copy_(torch.where(compact >= 0, logical, -1))

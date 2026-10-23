@@ -27,6 +27,15 @@ constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
 
+__device__ __forceinline__ BallotMask hisparse_ballot(bool predicate) {
+#ifdef USE_ROCM
+  // Older HIP/HCU toolchains do not expose CUDA's sync ballot intrinsic.
+  return __ballot(predicate);
+#else
+  return __ballot_sync(FULL_WARP_MASK, predicate);
+#endif
+}
+
 // Knuth multiplicative hash for open-addressing table of size hash_size.
 __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
@@ -352,7 +361,11 @@ template <
     bool SkipIO,
     typename SeqLensT,
     typename ReqPoolIndicesT>
-__global__ void load_cache_to_device_buffer_kernel(
+__global__
+#ifdef USE_ROCM
+    __launch_bounds__(BLOCK_SIZE, 1)
+#endif
+    void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k,
     int32_t* __restrict__ device_buffer_tokens,
     const int64_t* __restrict__ host_cache_locs,
@@ -546,8 +559,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int local_hit_offset = 0;
     int local_evict_offset = 0;
     if (has_valid_chunk) {
-      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
-      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+      const BallotMask hit_mask = hisparse_ballot(is_hit);
+      const BallotMask evict_mask = hisparse_ballot(is_evictable);
       local_hit_offset = popc_mask(hit_mask & lanes_before);
       local_evict_offset = popc_mask(evict_mask & lanes_before);
       if (lane_id == 0) {
@@ -623,7 +636,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
 
     if (has_valid_chunk) {
-      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
+      const BallotMask miss_mask = hisparse_ballot(is_miss);
       local_miss_offset = popc_mask(miss_mask & lanes_before);
       const int warp_miss_count = popc_mask(miss_mask);
       if (lane_id == 0) {

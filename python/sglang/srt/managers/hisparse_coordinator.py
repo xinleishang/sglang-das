@@ -129,6 +129,7 @@ def _build_prefetch_groups(
 
 
 class HiSparseCoordinator:
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -143,6 +144,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        host_pool: Optional[DeepSeekV4PagedHostPool] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -174,13 +176,17 @@ class HiSparseCoordinator:
                 + page_size
                 - 1
             ) // page_size
-            self.mem_pool_host = DeepSeekV4PagedHostPool(
-                pool_name="dsv4_hisparse_c4",
-                device_buffers=self.mem_pool_device.kv_buffer,
-                item_bytes=self.mem_pool_device.bytes_per_page_padded,
-                num_host_pages=num_host_pages,
-                slot_page_size=page_size,
-                layout="layer_first",
+            self.mem_pool_host = (
+                host_pool
+                if host_pool is not None
+                else DeepSeekV4PagedHostPool(
+                    pool_name="dsv4_hisparse_c4",
+                    device_buffers=self.mem_pool_device.kv_buffer,
+                    item_bytes=self.mem_pool_device.bytes_per_page_padded,
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout="layer_first",
+                )
             )
             self.item_size_bytes = (
                 self.mem_pool_device.kv_cache_total_dim
@@ -1019,6 +1025,8 @@ class HiSparseCoordinator:
             else {}
         )
         skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        if self.is_dsv4_hisparse and self.compress_ratio in (1, 2):
+            skip_io_kwargs["paged_layout"] = self.mem_pool_host.hisparse_layout
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],

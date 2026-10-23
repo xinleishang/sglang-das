@@ -980,7 +980,14 @@ class ModelRunner:
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
-        self.hisparse_coordinator = HiSparseCoordinator(
+        coordinator_cls = HiSparseCoordinator
+        if self.model_config.hf_text_config.model_type == "deepseek_v41":
+            from sglang.srt.managers.hisparse_v41_coordinator import (
+                DeepSeekV41HiSparseCoordinator,
+            )
+
+            coordinator_cls = DeepSeekV41HiSparseCoordinator
+        self.hisparse_coordinator = coordinator_cls(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             top_k=hisparse_top_k,

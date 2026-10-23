@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -87,6 +88,81 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
+def validate_deepseek_v41_hisparse(server_args: ServerArgs) -> None:
+    """Keep the initial C1/C2 implementation on its direct-to-host decode path."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    cfg = resolving_view(server_args)
+    restrictions = (
+        (cfg.disaggregation_mode != "decode", "requires PD decode mode"),
+        (
+            cfg.disaggregation_transfer_backend != "mooncake",
+            "requires Mooncake PD transfer",
+        ),
+        (cfg.pp_size != 1, "requires PP=1"),
+        (cfg.attn_cp_size != 1 or cfg.dcp_size != 1, "requires decode CP=1 and DCP=1"),
+        (cfg.enable_prefill_cp, "does not support CP on the decode instance"),
+        (cfg.enable_encoder_swa_bounded_replay, "does not support encoder SWA replay"),
+        (
+            cfg.cuda_graph_config.decode.backend not in (Backend.DISABLED, Backend.FULL),
+            "requires --cuda-graph-backend-decode full or disabled",
+        ),
+        (
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            "requires --cuda-graph-backend-prefill disabled",
+        ),
+        (
+            cfg.enable_hierarchical_cache or cfg.enable_unified_cache_external_linker,
+            "cannot share the decode instance with HiCache or an external linker",
+        ),
+        (
+            cfg.disaggregation_decode_enable_radix_cache,
+            "does not support decode-side radix caching",
+        ),
+        (
+            cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"),
+            "requires quantized paged KV (--kv-cache-dtype fp8_e4m3)",
+        ),
+        (is_unified_kv_triton(), "does not support the unified KV layout"),
+        (
+            not (get_platform().is_cuda or get_platform().is_hip),
+            "requires CUDA or HIP/HCU",
+        ),
+    )
+    for invalid, message in restrictions:
+        if invalid:
+            raise ValueError(f"DeepSeek-V4.1 HiSparse {message}.")
+    # Validation runs before the resolved memory configuration is published.
+    config = parse_hisparse_config(cfg.hisparse_config or "{}")
+    ratio = config.host_to_device_ratio
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(ratio)
+        or ratio < 1
+    ):
+        raise ValueError("V4.1 HiSparse host_to_device_ratio must be finite and >= 1")
+    buffer_size = config.device_buffer_size
+    model_config = model_config_of(server_args)
+    if any(ratio not in (0, 1, 2) for ratio in model_config.compress_ratios):
+        raise ValueError("V4.1 HiSparse currently supports C1/C2 compressed KV only")
+    model_topk = model_config.hf_config.index_topk
+    if (
+        not isinstance(buffer_size, int)
+        or isinstance(buffer_size, bool)
+        or not model_topk <= buffer_size < 32768
+        or (cfg.page_size is not None and buffer_size % cfg.page_size)
+    ):
+        raise ValueError(
+            "V4.1 HiSparse device_buffer_size must be an integer aligned to page_size, "
+            "at least the model index_topk, and less than 32768."
+        )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -113,6 +189,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
     validate_hisparse_feature_combos(server_args)
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        validate_deepseek_v41_hisparse(server_args)
+        return
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

@@ -19,6 +19,28 @@ if TYPE_CHECKING:
 _GATHER_BLOCK_SIZE = 64
 
 
+def _paged_layout_flags(layout: tuple[int, int, int, int] | None) -> list[str]:
+    if layout is None:
+        return []
+    page_size, value_bytes, scale_bytes, page_bytes = layout
+    if (
+        page_size <= 0
+        or value_bytes <= 0
+        or scale_bytes <= 0
+        or value_bytes % 8
+        or scale_bytes % 8
+        or page_bytes < page_size * (value_bytes + scale_bytes)
+        or page_bytes % 8
+    ):
+        raise ValueError(f"Invalid HiSparse paged KV layout: {layout}")
+    return [
+        f"-DSGL_HISPARSE_PAGE_SIZE={page_size}",
+        f"-DSGL_HISPARSE_VALUE_BYTES={value_bytes}",
+        f"-DSGL_HISPARSE_SCALE_BYTES={scale_bytes}",
+        f"-DSGL_HISPARSE_PAGE_BYTES={page_bytes}",
+    ]
+
+
 class HiSparseSpecState(NamedTuple):
     """Persistent cache state and reusable miss workspace for speculative swap.
 
@@ -178,6 +200,7 @@ def _jit_sparse_module(
     top_k_is_blocks: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> Module:
     # record_miss_plan / skip_io are compile-time kernel flags; the
     # (False, False) production instantiation stays byte-identical.
@@ -207,6 +230,8 @@ def _jit_sparse_module(
     return load_jit(
         "sparse_cache",
         *cache_args,
+        *(paged_layout or ()),
+        extra_cuda_cflags=_paged_layout_flags(paged_layout),
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
@@ -242,11 +267,15 @@ def _jit_copy_planned_module(
 
 
 @functools.cache
-def _jit_dsv4_transfer_module(block_size: int) -> Module:
+def _jit_dsv4_transfer_module(
+    block_size: int, paged_layout: tuple[int, int, int, int] | None = None
+) -> Module:
     template_args = make_cpp_args(block_size)
     return load_jit(
         "sparse_cache_dsv4_transfer",
         block_size,
+        *(paged_layout or ()),
+        extra_cuda_cflags=_paged_layout_flags(paged_layout),
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
@@ -263,9 +292,10 @@ def transfer_cache_dsv4_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     block_size: int = 1024,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
-    module = _jit_dsv4_transfer_module(block_size)
+    module = _jit_dsv4_transfer_module(block_size, paged_layout)
     module.transfer_cache_dsv4_mla(
         src_ptrs,
         dst_ptrs,
@@ -297,6 +327,7 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -312,6 +343,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        paged_layout=paged_layout,
     )
 
     empty = torch.empty(0, device=top_k_tokens.device)
@@ -540,6 +572,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -564,4 +597,5 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        paged_layout=paged_layout,
     )

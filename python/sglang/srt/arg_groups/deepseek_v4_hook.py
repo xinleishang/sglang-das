@@ -284,7 +284,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.speculative_algorithm is not None
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
-        ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         (
             "TRT-LLM with SWA bounded replay",

@@ -14,14 +14,21 @@ namespace device::hisparse {
 /// VALUE 0, VALUE 1, ..., VALUE 63,
 /// SCALE 0, SCALE 1, ..., SCALE 63,
 /// [Padding to align to 576 bytes]
-inline constexpr int64_t kPageSize = 64;
-inline constexpr int64_t kPageBits = 6;  // log2(kPageSize)
-inline constexpr int64_t kValueBytes = 576;
-inline constexpr int64_t kScaleBytes = 8;
+#ifndef SGL_HISPARSE_PAGE_SIZE
+#define SGL_HISPARSE_PAGE_SIZE 64
+#define SGL_HISPARSE_VALUE_BYTES 576
+#define SGL_HISPARSE_SCALE_BYTES 8
+#define SGL_HISPARSE_PAGE_BYTES 37440
+#endif
+inline constexpr int64_t kPageSize = SGL_HISPARSE_PAGE_SIZE;
+inline constexpr int64_t kValueBytes = SGL_HISPARSE_VALUE_BYTES;
+inline constexpr int64_t kScaleBytes = SGL_HISPARSE_SCALE_BYTES;
 /// NOTE: FlashMLA requires each page to be aligned to 576 bytes
 inline constexpr int64_t kItemBytes = kValueBytes + kScaleBytes;
-inline constexpr int64_t kPageBytes = host::div_ceil(kItemBytes * kPageSize, 576) * 576;
+inline constexpr int64_t kPageBytes = SGL_HISPARSE_PAGE_BYTES;
 inline constexpr int64_t kScaleOffset = kValueBytes * kPageSize;
+static_assert(kPageSize > 0 && kValueBytes % 8 == 0 && kScaleBytes % 8 == 0);
+static_assert(kPageBytes >= kItemBytes * kPageSize);
 
 struct PointerInfo {
   int64_t* value_ptr;
@@ -30,9 +37,8 @@ struct PointerInfo {
 
 SGL_DEVICE PointerInfo get_pointer_paged(void* cache, int32_t index) {
   using namespace device;
-  static_assert(1 << kPageBits == kPageSize);
-  const int32_t page_num = index >> kPageBits;
-  const int32_t page_offset = index & (kPageSize - 1);
+  const int32_t page_num = index / kPageSize;
+  const int32_t page_offset = index % kPageSize;
   const auto page_ptr = pointer::offset(cache, page_num * kPageBytes);
   const auto value_ptr = pointer::offset(page_ptr, page_offset * kValueBytes);
   const auto scale_ptr = pointer::offset(page_ptr, kScaleOffset + page_offset * kScaleBytes);
@@ -42,6 +48,21 @@ SGL_DEVICE PointerInfo get_pointer_paged(void* cache, int32_t index) {
 SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index) {
   const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(dst_cache, dst_index);
   const auto [src_value_ptr, src_scale_ptr] = get_pointer_paged(src_cache, src_index);
+
+  if constexpr (kValueBytes != 576 || kScaleBytes != 8) {
+    constexpr int value_words = kValueBytes / sizeof(int64_t);
+    constexpr int total_words = kItemBytes / sizeof(int64_t);
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int i = lane; i < total_words; i += 32) {
+      if (i < value_words) {
+        dst_value_ptr[i] = src_value_ptr[i];
+      } else {
+        dst_scale_ptr[i - value_words] = src_scale_ptr[i - value_words];
+      }
+    }
+    return;
+  }
 
   int64_t local_items[2];
   const int64_t* tail_src_ptr;

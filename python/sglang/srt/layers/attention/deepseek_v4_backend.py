@@ -2448,6 +2448,16 @@ class DeepseekV4AttnBackend(
         if isinstance(metadata, DSV4Metadata):
             core = metadata.core_metadata
             for ratio in core.low_ratios:
+                if (
+                    getattr(self.hisparse_coordinator, "is_dsv41", False)
+                    and core.sparse_raw_indices(ratio) is None
+                ):
+                    # Keep logical top-k even when capture skips the indexer.
+                    setattr(
+                        core,
+                        f"c{ratio}_sparse_raw_indices",
+                        torch.full_like(core.sparse_page_indices(ratio), -1),
+                    )
                 if skip_low_ratio_indexer(ratio):
                     # Share the full-position indices across layers of this ratio.
                     fill_all_compressed_indices(
@@ -3044,6 +3054,8 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        if getattr(self.hisparse_coordinator, "is_dsv41", False):
+            self.hisparse_coordinator.init_cuda_graph_state(max_bs)
         if self._dsv4_bf16_flashmla_decode:
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
@@ -3532,13 +3544,20 @@ class DeepseekV4AttnBackend(
             if pool.uniform_fp8
             else pool.get_extra_key_layout(layer_id)
         )
+        kv_write_loc = core.raw_out_loc
+        if getattr(self.hisparse_coordinator, "is_dsv41", False):
+            # C2's fused writer divides raw_loc by two. Keep an incomplete
+            # pair's original nonzero location so its state-ring write still runs.
+            kv_write_loc = pool.kv_pools[layer.compress_ratio].remap_fused_write_loc(
+                core.raw_out_loc, pos
+            )
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                kv_write_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3556,7 +3575,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                kv_write_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -5094,7 +5113,9 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        if (
+            self.mtp_enabled or getattr(self.hisparse_coordinator, "is_dsv41", False)
+        ) and forward_batch.forward_mode.is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
                 dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,
@@ -5121,6 +5142,19 @@ class DeepseekV4AttnBackend(
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                     compress_ratio
                 )
+                if getattr(self.hisparse_coordinator, "is_dsv41", False):
+                    if not forward_batch.forward_mode.is_decode():
+                        raise RuntimeError(
+                            "V4.1 HiSparse supports single-token decode only"
+                        )
+                    # Do not overwrite core's logical indexer tables: another
+                    # layer may share top-k but own a different hot KV buffer.
+                    extra_indices = self.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        core_attn_metadata.sparse_raw_indices(compress_ratio),
+                        layer_id,
+                    )
 
             swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
             assert swa_k_cache.ndim == 2
