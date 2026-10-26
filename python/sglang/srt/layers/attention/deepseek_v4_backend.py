@@ -2432,6 +2432,9 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
+        if getattr(self.hisparse_coordinator, "is_dsv41", False):
+            self.hisparse_coordinator.reset_swap_cache()
+
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
@@ -2544,6 +2547,8 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ) -> None:
+        if getattr(self.hisparse_coordinator, "is_dsv41", False):
+            self.hisparse_coordinator.reset_swap_cache()
         bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -3767,6 +3772,9 @@ class DeepseekV4AttnBackend(
         *,
         rows_per_request=None,  # NOTE: only used in CP
     ) -> None:
+        if getattr(self.hisparse_coordinator, "is_dsv41", False):
+            # Index-source layers rewrite the same per-ratio Top-K tensor.
+            self.hisparse_coordinator.reset_swap_cache(layer.compress_ratio)
         if _is_hcu:
             return self._hcu_low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
         is_source = layer.indexer.is_candidate_source
@@ -5154,6 +5162,7 @@ class DeepseekV4AttnBackend(
                         forward_batch.seq_lens,
                         core_attn_metadata.sparse_raw_indices(compress_ratio),
                         layer_id,
+                        reuse_topk=True,
                     )
 
             swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()

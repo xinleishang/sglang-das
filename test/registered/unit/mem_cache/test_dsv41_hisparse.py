@@ -167,6 +167,7 @@ class TestV41HiSparse(unittest.TestCase):
 
     def test_shared_layer_reads_its_physical_source_cache(self):
         coordinator = object.__new__(DeepSeekV41HiSparseCoordinator)
+        coordinator.reset_swap_cache()
         child = MagicMock()
         coordinator.pools = {2: child}
         coordinator.kvcache = SimpleNamespace(
@@ -327,6 +328,123 @@ class TestV41HiSparse(unittest.TestCase):
                 ):
                     with self.assertRaises(ValueError):
                         hisparse_hook.validate_deepseek_v41_hisparse(args)
+
+
+class TestV41SwapReuse(unittest.TestCase):
+    def setUp(self):
+        self.coord = object.__new__(DeepSeekV41HiSparseCoordinator)
+        self.coord.reset_swap_cache()
+        self.coord.kvcache = SimpleNamespace(
+            layer_mapping={
+                layer: SimpleNamespace(
+                    compress_ratio=2 if layer < 20 else 1,
+                    compress_layer_id=(layer - 2) // 6 if layer < 20 else 0,
+                )
+                for layer in range(2, 40)
+            }
+        )
+        self.coord.pools = {ratio: MagicMock() for ratio in (1, 2)}
+        for child in self.coord.pools.values():
+            child.swap_in_selected_pages.side_effect = (
+                lambda reqs, lens, topk, source: topk.clone()
+            )
+            child.top_k_device_locs_buffer = torch.zeros((2, 4), dtype=torch.int32)
+        self.reqs = torch.tensor([0, 1])
+        self.lens = torch.tensor([16384, 32768])
+        self.topk = {ratio: torch.tensor([[0, 1], [2, 3]]) for ratio in (1, 2)}
+
+    def swap(self, layer=20, *, reuse_topk=True):
+        ratio = self.coord.kvcache.layer_mapping[layer].compress_ratio
+        return self.coord.swap_in_selected_pages(
+            self.reqs, self.lens, self.topk[ratio], layer, reuse_topk=reuse_topk
+        )
+
+    def test_model_groups_reduce_38_swaps_to_8(self):
+        index_sources = {2, 8, 14, 20, 24, 28, 32, 36}
+        previous = None
+        for layer in range(2, 40):
+            if layer in index_sources:
+                ratio = self.coord.kvcache.layer_mapping[layer].compress_ratio
+                self.coord.reset_swap_cache(ratio)
+                self.topk[ratio].add_(1)
+            result = self.swap(layer)
+            if layer not in index_sources:
+                self.assertIs(result, previous)
+            previous = result
+        self.assertEqual(self.coord.pools[2].swap_in_selected_pages.call_count, 3)
+        self.assertEqual(self.coord.pools[1].swap_in_selected_pages.call_count, 5)
+
+    def test_indexer_rewrite_invalidates_same_tensor_and_kv_source(self):
+        first = self.swap(20)
+        self.assertIs(self.swap(21), first)
+        self.coord.reset_swap_cache(1)
+        self.topk[1].add_(100)
+        second = self.swap(24)
+        self.assertIsNot(first, second)
+        torch.testing.assert_close(second, first + 100)
+        self.assertIs(self.swap(25), second)
+
+    def test_different_physical_sources_cannot_share_output_table(self):
+        first = self.swap(2)
+        self.assertIs(self.swap(3), first)
+        second = self.swap(8)
+        self.assertIsNot(first, second)
+        self.assertIs(self.swap(9), second)
+        # C2's one output table was overwritten by source 1.
+        self.assertIsNot(self.swap(2), first)
+        calls = self.coord.pools[2].swap_in_selected_pages.call_args_list
+        self.assertEqual([call.args[3] for call in calls], [0, 1, 0])
+
+    def test_ratios_have_independent_results_and_invalidation(self):
+        c1, c2 = self.swap(20), self.swap(2)
+        self.assertIs(self.swap(21), c1)
+        self.assertIs(self.swap(3), c2)
+        self.coord.reset_swap_cache(1)
+        self.assertIs(self.swap(4), c2)
+        self.assertIsNot(self.swap(22), c1)
+
+    def test_new_batch_or_topk_object_requires_fresh_swap(self):
+        previous = self.swap()
+        self.reqs = self.reqs.flip(0)
+        current = self.swap()
+        self.assertIsNot(current, previous)
+        previous, self.lens = current, self.lens + 1
+        current = self.swap()
+        self.assertIsNot(current, previous)
+        previous, self.topk[1] = current, self.topk[1].clone()
+        self.assertIsNot(self.swap(), previous)
+        self.assertEqual(self.coord.pools[1].swap_in_selected_pages.call_count, 4)
+
+    def test_forward_reset_handles_in_place_replay_inputs(self):
+        previous = self.swap()
+        self.reqs.copy_(self.reqs.flip(0))
+        self.lens.add_(1)
+        self.topk[1].add_(20)
+        self.coord.reset_swap_cache()
+        current = self.swap()
+        self.assertIsNot(current, previous)
+        torch.testing.assert_close(current, previous + 20)
+
+    def test_uncached_call_invalidates_previously_cached_output(self):
+        first = self.swap()
+        direct = self.swap(reuse_topk=False)
+        self.assertIsNot(direct, first)
+        second = self.swap()
+        self.assertIsNot(second, first)
+        self.assertIs(self.swap(21), second)
+        self.assertEqual(self.coord.pools[1].swap_in_selected_pages.call_count, 3)
+
+    def test_request_lifecycle_and_graph_resize_clear_reuse(self):
+        operations = (
+            lambda: self.coord.request_finished(SimpleNamespace()),
+            lambda: self.coord.map_last_loc_to_buffer(),
+            lambda: self.coord.init_cuda_graph_state(4),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                previous = self.swap()
+                operation()
+                self.assertIsNot(self.swap(), previous)
 
 
 if __name__ == "__main__":

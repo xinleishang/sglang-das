@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
@@ -10,6 +12,15 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseTokenStats,
 )
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+
+@dataclass
+class _SwapResult:
+    source_layer: int
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    topk: torch.Tensor
+    locations: torch.Tensor
 
 
 class _LogicalPageHostMirror(DeepSeekV4PagedHostPool):
@@ -105,6 +116,7 @@ class DeepSeekV41HiSparseCoordinator:
         self.kvcache = token_to_kv_pool_allocator.get_kvcache()
         self.device_buffer_size = device_buffer_size
         self.ack_staging_queue = []
+        self.reset_swap_cache()
         if device_buffer_size < top_k or device_buffer_size >= 32768:
             raise ValueError(
                 "V4.1 HiSparse requires top_k <= device_buffer_size < 32768"
@@ -148,6 +160,7 @@ class DeepSeekV41HiSparseCoordinator:
             child.num_real_reqs = self.num_real_reqs
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
+        self.reset_swap_cache()
         # Output rows follow the padded graph batch, not the request-slot count.
         # Request-owned hot/host tables remain unchanged; num_real_reqs masks
         # padding before the swap kernel accesses any of those tables.
@@ -182,6 +195,7 @@ class DeepSeekV41HiSparseCoordinator:
         return ptrs, sizes, strides, kinds
 
     def admit_request_direct(self, req):
+        self.reset_swap_cache()
         try:
             for child in self.pools.values():
                 n = child.host_token_len(req.kv.kv_allocated_len)
@@ -211,20 +225,54 @@ class DeepSeekV41HiSparseCoordinator:
             raise
 
     def map_last_loc_to_buffer(self, *args, **kwargs):
+        self.reset_swap_cache()
         for child in self.pools.values():
             child.map_last_loc_to_buffer(*args, **kwargs)
 
-    def swap_in_selected_pages(self, req_pool_indices, seq_lens, topk, layer_id):
+    def reset_swap_cache(self, compress_ratio: int | None = None) -> None:
+        """Invalidate at forward boundaries and before an indexer rewrites Top-K."""
+        if compress_ratio is None:
+            self._swap_cache: dict[int, _SwapResult] = {}
+        else:
+            self._swap_cache.pop(compress_ratio, None)
+
+    def swap_in_selected_pages(
+        self, req_pool_indices, seq_lens, topk, layer_id, *, reuse_topk: bool = False
+    ):
+        """Reuse only within a forward whose indexer updates invalidate the cache.
+
+        During graph capture this omits redundant swaps; every replay still
+        executes the captured producer swap before its consumers' attention.
+        """
         item = self.kvcache.layer_mapping[layer_id]
         child = self.pools[item.compress_ratio]
         if topk is None:
             raise RuntimeError("V4.1 HiSparse requires logical top-k indices")
-        return child.swap_in_selected_pages(
+        cached = self._swap_cache.get(item.compress_ratio)
+        if (
+            reuse_topk
+            and cached is not None
+            and cached.source_layer == item.compress_layer_id
+            and cached.req_pool_indices is req_pool_indices
+            and cached.seq_lens is seq_lens
+            and cached.topk is topk
+        ):
+            return cached.locations
+
+        # Each ratio has one output table, even when it has multiple KV sources.
+        # Any swap into it invalidates the previous source's cached result.
+        self.reset_swap_cache(item.compress_ratio)
+        locations = child.swap_in_selected_pages(
             req_pool_indices,
             seq_lens // item.compress_ratio,
             topk,
             item.compress_layer_id,
         )
+        if reuse_topk:
+            self._swap_cache[item.compress_ratio] = _SwapResult(
+                item.compress_layer_id, req_pool_indices, seq_lens, topk, locations
+            )
+        return locations
 
     def set_decode_producer_stream(self, stream):
         for child in self.pools.values():
@@ -235,6 +283,7 @@ class DeepSeekV41HiSparseCoordinator:
             child.wait_for_pending_backup()
 
     def request_finished(self, req):
+        self.reset_swap_cache()
         for child in self.pools.values():
             child.request_finished(req)
 
