@@ -386,7 +386,7 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse and not self.is_draft_worker
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
@@ -981,12 +981,17 @@ class ModelRunner:
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
         coordinator_cls = HiSparseCoordinator
+        coordinator_kwargs = {}
         if self.model_config.hf_text_config.model_type == "deepseek_v41":
             from sglang.srt.managers.hisparse_v41_coordinator import (
                 DeepSeekV41HiSparseCoordinator,
             )
 
             coordinator_cls = DeepSeekV41HiSparseCoordinator
+            if self.spec_algorithm.is_dspark():
+                coordinator_kwargs["num_draft_tokens"] = (
+                    get_spec().speculative_num_draft_tokens
+                )
         self.hisparse_coordinator = coordinator_cls(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1000,6 +1005,7 @@ class ModelRunner:
                 hf_text_config=self.model_config.hf_text_config,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            **coordinator_kwargs,
         )
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
@@ -1666,6 +1672,7 @@ class ModelRunner:
         forward path needs — the cuda-graph path does the equivalent inside the
         runner's capture/replay, so this is skipped there.
         """
+        num_real_reqs = forward_batch.batch_size
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
@@ -1692,7 +1699,7 @@ class ModelRunner:
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            self.hisparse_coordinator.num_real_reqs.fill_(num_real_reqs)
 
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:
         """Build the pp_proxy_tensors forward kwarg, in one place.
@@ -1940,8 +1947,9 @@ class ModelRunner:
 
             if (
                 forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_idle()
+            ) and self.hisparse_coordinator is not None:
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)

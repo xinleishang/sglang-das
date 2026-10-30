@@ -1784,7 +1784,7 @@ class KVCacheConfigurator:
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_hisparse=get_memory().enable_hisparse,
+            enable_hisparse=get_memory().enable_hisparse and not self.is_draft_worker,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
             unified_fp8=unified_fp8,
             kv_source_layers=kv_source_layers,
@@ -2571,7 +2571,11 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if (
+                get_memory().enable_hisparse
+                and is_dsv4_model
+                and not self.is_draft_worker
+            ):
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 allocator_cls = (
                     DeepSeekV41HiSparseTokenToKVPoolAllocator

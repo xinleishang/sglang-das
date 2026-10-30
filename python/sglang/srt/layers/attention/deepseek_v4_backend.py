@@ -5151,9 +5151,12 @@ class DeepseekV4AttnBackend(
                     compress_ratio
                 )
                 if getattr(self.hisparse_coordinator, "is_dsv41", False):
-                    if not forward_batch.forward_mode.is_decode():
+                    is_verify = forward_batch.forward_mode.is_target_verify()
+                    if not forward_batch.forward_mode.is_decode() and not (
+                        is_verify and self.hisparse_coordinator.num_draft_tokens
+                    ):
                         raise RuntimeError(
-                            "V4.1 HiSparse supports single-token decode only"
+                            "V4.1 HiSparse requires decode or fixed-width DSpark verify"
                         )
                     # Do not overwrite core's logical indexer tables: another
                     # layer may share top-k but own a different hot KV buffer.
@@ -5163,6 +5166,7 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata.sparse_raw_indices(compress_ratio),
                         layer_id,
                         reuse_topk=True,
+                        **({"positions": forward_batch.positions} if is_verify else {}),
                     )
 
             swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()

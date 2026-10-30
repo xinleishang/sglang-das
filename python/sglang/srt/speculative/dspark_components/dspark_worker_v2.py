@@ -648,6 +648,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+        if _is_hcu and not self._is_lifecycle_only_pp_prefill_rank:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+
+            # Eager decode proposes with the draft first. Reserve both layouts
+            # here instead of relying on target CUDA Graph warmup to do it.
+            DeepEPBuffer.prepare_for_models(
+                self.target_worker.model_runner.model, self.draft_model
+            )
 
     def init_cuda_graphs(self):
         if (
@@ -1235,6 +1243,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         )
 
+        hisparse = self.model_runner.hisparse_coordinator
+        if hisparse is not None:
+            hisparse.prepare_spec_verify(
+                batch.req_pool_indices, prefix_lens, verify_window.verify_cache_loc
+            )
+
         sampling_info = batch.sampling_info
         # Simulated acceptance overrides correct_len, so only the bonus token needs the
         # request's temperature: draft + accept run greedy, the bonus is still sampled.
@@ -1378,6 +1392,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
+        if hisparse is not None:
+            hisparse.commit_spec_verify(
+                batch.req_pool_indices,
+                prefix_lens,
+                verify_window.verify_cache_loc,
+                accept.commit_lens,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,

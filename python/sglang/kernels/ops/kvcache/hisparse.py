@@ -67,6 +67,7 @@ def _jit_spec_module(
     hot_buffer_size: int,
     num_steps: int,
     record_miss_plan: bool,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -80,6 +81,8 @@ def _jit_spec_module(
     return load_jit(
         "hisparse_spec",
         *template_args,
+        *(paged_layout or ()),
+        extra_cuda_cflags=_paged_layout_flags(paged_layout),
         cuda_files=["kvcacheio/hisparse_spec.cuh"],
         cuda_wrappers=[
             (
@@ -106,6 +109,7 @@ def load_cache_to_device_buffer_spec_mla(
     miss_src: torch.Tensor | None = None,
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
+    paged_layout: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
@@ -114,13 +118,22 @@ def load_cache_to_device_buffer_spec_mla(
     ``copy_cache_planned_mla``.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= 4:
+    max_steps = 16 if paged_layout is not None else 4
+    if not 2 <= num_steps <= max_steps:
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, got {num_steps}."
+            f"HiSparse speculative swap requires 2-{max_steps} steps, got {num_steps}."
         )
+    if num_steps * num_top_k > 8192:
+        raise ValueError("HiSparse speculative swap supports at most 8192 occurrences")
+    if paged_layout is not None and (num_top_k < 64 or num_top_k % 64):
+        raise ValueError("Paged HiSparse speculative top_k must be a multiple of 64")
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
-    item_size_bytes = host_cache.stride(0) * host_cache.element_size()
+    item_size_bytes = (
+        paged_layout[1] + paged_layout[2]
+        if paged_layout is not None
+        else host_cache.stride(0) * host_cache.element_size()
+    )
     record_miss_plan = miss_src is not None
     if record_miss_plan:
         if miss_dst is None or miss_count is None:
@@ -164,6 +177,7 @@ def load_cache_to_device_buffer_spec_mla(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        paged_layout,
     )
 
     module.load_cache_to_device_buffer_spec(

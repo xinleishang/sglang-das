@@ -694,7 +694,11 @@ class DeepSeekV41HiSparseTokenToKVPoolAllocator(
     def available_request_buffers(self, device_buffer_size: int) -> int:
         return min(
             allocator.hisparse_attn_allocator.available_size()
-            // (device_buffer_size + allocator.hisparse_page_size)
+            // (
+                device_buffer_size
+                + allocator.hisparse_page_size
+                + getattr(self, "spec_scratch_size", 0)
+            )
             for allocator in self.ratio_allocators.values()
         )
 

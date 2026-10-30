@@ -80,10 +80,15 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
-    # Both crash on the first request: the draft pool has no HiSparse mapping,
-    # and a mixed batch cannot merge the HiSparse decode batch.
     if cfg.speculative_algorithm is not None:
-        raise ValueError("--enable-hisparse does not support speculative decoding yet.")
+        hf_config = model_config_of(server_args).hf_config
+        if not (
+            cfg.speculative_algorithm == "DSPARK"
+            and getattr(hf_config, "model_type", None) == "deepseek_v41"
+        ):
+            raise ValueError(
+                "--enable-hisparse supports speculative decoding only with DeepSeek-V4.1 DSpark."
+            )
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
@@ -108,7 +113,8 @@ def validate_deepseek_v41_hisparse(server_args: ServerArgs) -> None:
         (cfg.enable_prefill_cp, "does not support CP on the decode instance"),
         (cfg.enable_encoder_swa_bounded_replay, "does not support encoder SWA replay"),
         (
-            cfg.cuda_graph_config.decode.backend not in (Backend.DISABLED, Backend.FULL),
+            cfg.cuda_graph_config.decode.backend
+            not in (Backend.DISABLED, Backend.FULL),
             "requires --cuda-graph-backend-decode full or disabled",
         ),
         (
@@ -151,6 +157,34 @@ def validate_deepseek_v41_hisparse(server_args: ServerArgs) -> None:
     if any(ratio not in (0, 1, 2) for ratio in model_config.compress_ratios):
         raise ValueError("V4.1 HiSparse currently supports C1/C2 compressed KV only")
     model_topk = model_config.hf_config.index_topk
+    if cfg.speculative_algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        width = cfg.speculative_num_draft_tokens
+        if (
+            cfg.speculative_adaptive
+            or read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+        ):
+            raise ValueError(
+                "V4.1 HiSparse DSpark requires fixed-width static verify, without adaptive speculation"
+            )
+        if (
+            width is None
+            or not 2 <= width <= 16
+            or width * model_topk > 8192
+            or model_topk < 64
+            or model_topk % 64
+        ):
+            raise ValueError(
+                "V4.1 HiSparse DSpark requires verify width 2-16, width * index_topk <= 8192, and index_topk % 64 == 0"
+            )
+        if not get_platform().is_hcu:
+            raise ValueError(
+                "V4.1 HiSparse DSpark currently requires the HCU indexer path with logical Top-K outputs"
+            )
     if (
         not isinstance(buffer_size, int)
         or isinstance(buffer_size, bool)

@@ -227,9 +227,94 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
                 num_topk=None,
+                num_qps_per_rank=None,
             )
             buffers["deepep_ep_state"] = state
         return state
+
+    @classmethod
+    def prepare_for_models(cls, *models):
+        """Reserve one HCU buffer before either speculative model runs."""
+        if not _is_hcu:
+            return
+
+        impls = []
+        for model in models:
+            for module in model.modules():
+                dispatcher = getattr(module, "dispatcher", None)
+                # MaybeTboDeepEPDispatcher owns one or two concrete dispatchers.
+                for inner in getattr(dispatcher, "_inners", (dispatcher,)):
+                    if isinstance(inner, DeepEPDispatcher):
+                        impls.append(
+                            inner._low_latency_dispatcher
+                            if inner.deepep_mode.enable_low_latency()
+                            else inner._normal_dispatcher
+                        )
+        ll_impls = [impl for impl in impls if impl.deepep_mode.enable_low_latency()]
+        if not ll_impls:
+            return
+
+        group = ll_impls[0].group
+        hidden_size = ll_impls[0].hidden_size
+        for impl in impls:
+            if impl.hidden_size != hidden_size or (
+                impl.group is not group
+                and dist.get_process_group_ranks(impl.group)
+                != dist.get_process_group_ranks(group)
+            ):
+                raise ValueError(
+                    "Shared HCU DeepEP buffer requires identical hidden sizes "
+                    "and ordered EP ranks for target and draft."
+                )
+
+        # Reserve the union of normal/LL requirements, including QPs. A draft
+        # forward must not determine the allocation used by the larger target.
+        mode = (
+            DeepEPMode.AUTO
+            if any(impl.deepep_mode.enable_normal() for impl in impls)
+            else DeepEPMode.LOW_LATENCY
+        )
+        max_tokens = max(impl.num_max_dispatch_tokens_per_rank for impl in ll_impls)
+        num_experts = max(impl.num_experts for impl in ll_impls)
+        num_topk = max(impl.router_topk for impl in ll_impls)
+        num_qps = num_experts // group.size()
+        if mode.enable_normal():
+            num_qps = max(num_qps, DeepEPConfig.get_instance().num_sms)
+
+        state = cls._state()
+        if state.buffer is not None and (
+            not state.deepep_mode.enable_low_latency()
+            or (mode.enable_normal() and not state.deepep_mode.enable_normal())
+            or state.group_size != group.size()
+            or state.hidden_size != hidden_size
+            or state.num_qps_per_rank is None
+            or state.num_qps_per_rank < num_qps
+        ):
+            raise RuntimeError(
+                "Prepare the shared HCU DeepEP buffer before the first forward "
+                "or CUDA Graph capture; the existing allocation is incompatible."
+            )
+        buffer = cls.get_deepep_buffer(
+            group=group,
+            hidden_size=hidden_size,
+            param_bytes=max(impl.params_bytes for impl in impls),
+            deepep_mode=mode,
+            num_max_dispatch_tokens_per_rank=max_tokens,
+            num_experts=num_experts,
+            num_topk=num_topk,
+        )
+        logger.info(
+            "Prepared shared HCU DeepEP buffer: max_dispatch_tokens=%s, "
+            "hidden_size=%s, num_experts=%s, num_topk=%s, "
+            "num_qps_per_rank=%s, rdma_bytes=%s",
+            max_tokens,
+            hidden_size,
+            num_experts,
+            num_topk,
+            state.num_qps_per_rank,
+            buffer.num_rdma_bytes,
+        )
+        return buffer
 
     @classmethod
     def get_deepep_buffer(
@@ -385,6 +470,7 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        state.num_qps_per_rank = num_qps_per_rank
         return state.buffer
 
     @classmethod

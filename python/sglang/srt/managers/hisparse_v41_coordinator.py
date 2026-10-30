@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -13,6 +14,8 @@ from sglang.srt.managers.hisparse_coordinator import (
 )
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _SwapResult:
@@ -21,6 +24,7 @@ class _SwapResult:
     seq_lens: torch.Tensor
     topk: torch.Tensor
     locations: torch.Tensor
+    positions: torch.Tensor | None = None
 
 
 class _LogicalPageHostMirror(DeepSeekV4PagedHostPool):
@@ -111,11 +115,14 @@ class DeepSeekV41HiSparseCoordinator:
         host_to_device_ratio=2,
         swap_in_block_size=960,
         shared_index_layers=None,
+        num_draft_tokens=0,
     ):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.kvcache = token_to_kv_pool_allocator.get_kvcache()
         self.device_buffer_size = device_buffer_size
         self.ack_staging_queue = []
+        self.spec_pools = {}
+        self.num_draft_tokens = num_draft_tokens
         self.reset_swap_cache()
         if device_buffer_size < top_k or device_buffer_size >= 32768:
             raise ValueError(
@@ -125,10 +132,16 @@ class DeepSeekV41HiSparseCoordinator:
             raise ValueError(
                 "V4.1 HiSparse device_buffer_size must align to the FULL page size"
             )
+        if num_draft_tokens:
+            token_to_kv_pool_allocator.spec_scratch_size = (
+                (num_draft_tokens * top_k + token_to_kv_pool_allocator.page_size - 1)
+                // token_to_kv_pool_allocator.page_size
+                * token_to_kv_pool_allocator.page_size
+            )
         if token_to_kv_pool_allocator.available_request_buffers(device_buffer_size) < 1:
             raise ValueError(
                 "V4.1 HiSparse GPU pools cannot hold one request's hot buffer plus "
-                "its reserved page. Reduce device_buffer_size or host_to_device_ratio."
+                "its reserved page and verify scratch. Reduce device_buffer_size or host_to_device_ratio."
             )
         self.pools = {}
         try:
@@ -152,15 +165,39 @@ class DeepSeekV41HiSparseCoordinator:
                     host.destroy()
                     raise
                 self.pools[ratio] = child
+                if num_draft_tokens:
+                    from sglang.srt.managers.hisparse_v41_spec import V41SpeculativePool
+
+                    self.spec_pools[ratio] = V41SpeculativePool(child, num_draft_tokens)
         except Exception:
             self.destroy()
             raise
         self.num_real_reqs = next(iter(self.pools.values())).num_real_reqs
         for child in self.pools.values():
             child.num_real_reqs = self.num_real_reqs
+        if self.spec_pools:
+            metadata_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for pool in self.spec_pools.values()
+                for state in pool.states
+                for tensor in state
+            )
+            logger.info(
+                "V4.1 HiSparse DSpark: verify_width=%d, top_k=%d, "
+                "scratch_slots_per_request=%s, metadata=%.1f MiB, available_requests=%d",
+                num_draft_tokens,
+                top_k,
+                {r: p.capacity for r, p in self.spec_pools.items()},
+                metadata_bytes / 2**20,
+                token_to_kv_pool_allocator.available_request_buffers(
+                    device_buffer_size
+                ),
+            )
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         self.reset_swap_cache()
+        for pool in self.spec_pools.values():
+            pool.resize_output(max_bs)
         # Output rows follow the padded graph batch, not the request-slot count.
         # Request-owned hot/host tables remain unchanged; num_real_reqs masks
         # padding before the swap kernel accesses any of those tables.
@@ -207,6 +244,8 @@ class DeepSeekV41HiSparseCoordinator:
                     n,
                 )
                 child.admit_request_direct(req)
+                if child.compress_ratio in self.spec_pools:
+                    self.spec_pools[child.compress_ratio].admit(req)
                 # On an odd C2 step no new compressed record is written. The
                 # swap kernel nevertheless reads its newest record from the
                 # reserved slot, which must already contain the PD tail.
@@ -225,6 +264,10 @@ class DeepSeekV41HiSparseCoordinator:
             raise
 
     def map_last_loc_to_buffer(self, *args, **kwargs):
+        if self.num_draft_tokens:
+            raise RuntimeError(
+                "DSpark HiSparse must use prepare_spec_verify, not single-token mapping"
+            )
         self.reset_swap_cache()
         for child in self.pools.values():
             child.map_last_loc_to_buffer(*args, **kwargs)
@@ -237,7 +280,14 @@ class DeepSeekV41HiSparseCoordinator:
             self._swap_cache.pop(compress_ratio, None)
 
     def swap_in_selected_pages(
-        self, req_pool_indices, seq_lens, topk, layer_id, *, reuse_topk: bool = False
+        self,
+        req_pool_indices,
+        seq_lens,
+        topk,
+        layer_id,
+        *,
+        reuse_topk: bool = False,
+        positions=None,
     ):
         """Reuse only within a forward whose indexer updates invalidate the cache.
 
@@ -256,23 +306,51 @@ class DeepSeekV41HiSparseCoordinator:
             and cached.req_pool_indices is req_pool_indices
             and cached.seq_lens is seq_lens
             and cached.topk is topk
+            and cached.positions is positions
         ):
             return cached.locations
 
         # Each ratio has one output table, even when it has multiple KV sources.
         # Any swap into it invalidates the previous source's cached result.
         self.reset_swap_cache(item.compress_ratio)
-        locations = child.swap_in_selected_pages(
-            req_pool_indices,
-            seq_lens // item.compress_ratio,
-            topk,
-            item.compress_layer_id,
-        )
+        if positions is not None:
+            locations = self.spec_pools[item.compress_ratio].swap(
+                req_pool_indices, positions, topk, item.compress_layer_id
+            )
+        else:
+            locations = child.swap_in_selected_pages(
+                req_pool_indices,
+                seq_lens // item.compress_ratio,
+                topk,
+                item.compress_layer_id,
+            )
         if reuse_topk:
             self._swap_cache[item.compress_ratio] = _SwapResult(
-                item.compress_layer_id, req_pool_indices, seq_lens, topk, locations
+                item.compress_layer_id,
+                req_pool_indices,
+                seq_lens,
+                topk,
+                locations,
+                positions,
             )
         return locations
+
+    def prepare_spec_verify(self, reqs, prefix_lens, verify_locs):
+        if not self.spec_pools:
+            raise RuntimeError("HiSparse coordinator was not initialized for DSpark")
+        if verify_locs.numel() != reqs.numel() * self.num_draft_tokens:
+            raise ValueError("HiSparse DSpark verify window has an unexpected width")
+        self.reset_swap_cache()
+        self.wait_for_pending_backup()
+        for pool in self.spec_pools.values():
+            pool.prepare(reqs, prefix_lens, verify_locs)
+
+    def commit_spec_verify(self, reqs, prefix_lens, verify_locs, commit_lens):
+        # Same producer stream as target verify; finish copies before publication
+        # allows another step or request reclamation to reuse the write page.
+        for pool in self.spec_pools.values():
+            pool.commit(reqs, prefix_lens, verify_locs, commit_lens)
+        self.reset_swap_cache()
 
     def set_decode_producer_stream(self, stream):
         for child in self.pools.values():
@@ -286,6 +364,8 @@ class DeepSeekV41HiSparseCoordinator:
         self.reset_swap_cache()
         for child in self.pools.values():
             child.request_finished(req)
+            if child.compress_ratio in self.spec_pools:
+                self.spec_pools[child.compress_ratio].release(req)
 
     def retract_req(self, req):
         self.request_finished(req)

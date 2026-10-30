@@ -248,6 +248,9 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
   for (uint32_t i = global_tid / WARP_SIZE; i < num_items; i += total_warps) {
     const int32_t src_index = static_cast<int32_t>(src_indices[i]);
     const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
+    if (src_index < 0 || dst_index < 0) {
+      continue;
+    }
     for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
       device::hisparse::transfer_item(
           /*dst_cache=*/dst_caches[layer_id],

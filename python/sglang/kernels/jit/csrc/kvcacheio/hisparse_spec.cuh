@@ -1,12 +1,18 @@
 #pragma once
 
 // Multi-step speculative HiSparse cache-management kernels.
-// DSv4 cache transfer remains in hisparse.cuh.
+// A paged instantiation copies value and scale regions independently.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
 
 #include <sgl_kernel/utils.cuh>  // LaunchKernel and PDL helpers
+#include <sgl_kernel/runtime.cuh>
+
+#ifdef SGL_HISPARSE_PAGE_SIZE
+#include <sgl_kernel/deepseek_v4/kvcacheio.cuh>
+#define SGL_HISPARSE_SPEC_PAGED 1
+#endif
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -361,11 +367,34 @@ __device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* 
 
 #endif
 
+template <int ITEM_SIZE_BYTES>
+__device__ __forceinline__ void transfer_spec_item(
+    int32_t lane, const void* src_cache, void* dst_cache, int64_t src_index, int32_t dst_index) {
+#ifdef SGL_HISPARSE_SPEC_PAGED
+  const auto src = device::hisparse::get_pointer_paged(const_cast<void*>(src_cache), src_index);
+  const auto dst = device::hisparse::get_pointer_paged(dst_cache, dst_index);
+  transfer_item_warp<device::hisparse::kValueBytes>(lane, src.value_ptr, dst.value_ptr);
+  transfer_item_warp<device::hisparse::kScaleBytes>(lane, src.scale_ptr, dst.scale_ptr);
+#else
+  const auto src = static_cast<const char*>(src_cache) + src_index * ITEM_SIZE_BYTES;
+  auto dst = static_cast<char*>(dst_cache) + static_cast<int64_t>(dst_index) * ITEM_SIZE_BYTES;
+  transfer_item_warp<ITEM_SIZE_BYTES>(lane, src, dst);
+#endif
+}
+
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
-  return __ffsll(mask) - 1;
+  return __ffsll(static_cast<unsigned long long>(mask)) - 1;
 #else
   return __ffs(mask) - 1;
+#endif
+}
+
+__device__ __forceinline__ BallotMask spec_ballot(bool predicate) {
+#ifdef USE_ROCM
+  return __ballot(predicate);
+#else
+  return __ballot_sync(FULL_WARP_MASK, predicate);
 #endif
 }
 
@@ -447,7 +476,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
       }
     }
     for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
-      req_top_k_device_locs[i] = 0;
+      req_top_k_device_locs[i] = -1;
     return;
   }
 
@@ -584,7 +613,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     req_top_k_device_locs[occ] = loc;
   }
 
-  BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
+  BallotMask copy_mask = spec_ballot(copy_owner);
   while (copy_mask != 0) {
     const int owner_lane = first_set_lane(copy_mask);
     const int32_t copy_token = __shfl_sync(FULL_WARP_MASK, token, owner_lane);
@@ -598,16 +627,14 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
-      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      transfer_spec_item<ITEM_SIZE_BYTES>(lane_id, host_cache_k, device_buffer_k, copy_src_loc, copy_loc);
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
 }
 
 template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
-__global__ void load_cache_to_device_buffer_spec_commit_kernel(
+__global__ __launch_bounds__(512) void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
     int32_t* __restrict__ device_buffer_tokens,
@@ -859,7 +886,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
       }
     }
 
-    BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
+    BallotMask copy_mask = spec_ballot(copy_owner);
     while (copy_mask != 0) {
       const int owner_lane = first_set_lane(copy_mask);
       const int64_t src_loc = __shfl_sync(FULL_WARP_MASK, copy_src_loc, owner_lane);
@@ -872,9 +899,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
-        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
-        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        transfer_spec_item<ITEM_SIZE_BYTES>(lane_id, host_cache_k, device_buffer_k, src_loc, dst_loc);
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -957,8 +982,13 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
+#ifdef SGL_HISPARSE_SPEC_PAGED
+  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 16, "Paged speculative swap requires 2-16 steps.");
+  static_assert(NUM_TOP_K >= 64 && NUM_TOP_K % 64 == 0, "Paged speculative top_k must be a multiple of 64.");
+#else
   static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+#endif
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -1048,6 +1078,7 @@ void load_cache_to_device_buffer_spec(
   TensorMatcher({bs}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices);
   TensorMatcher({bs * NUM_STEPS}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
   const auto device = cuda_device.unwrap();
+  const void* host_cache_ptr = runtime::get_device_accessible_ptr(host_cache_k);
 
   const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
   LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
@@ -1062,7 +1093,7 @@ void load_cache_to_device_buffer_spec(
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
       static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-      host_cache_k.data_ptr(),
+      host_cache_ptr,
       device_buffer_k.data_ptr(),
       static_cast<int32_t*>(top_k_device_locs.data_ptr()),
       static_cast<const int64_t*>(req_pool_indices.data_ptr()),
@@ -1094,7 +1125,7 @@ void load_cache_to_device_buffer_spec(
           static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
           static_cast<int32_t*>(device_buffer_locs.data_ptr()),
           static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-          host_cache_k.data_ptr(),
+          host_cache_ptr,
           device_buffer_k.data_ptr(),
           static_cast<const int64_t*>(req_pool_indices.data_ptr()),
           cache_state,
